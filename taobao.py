@@ -74,8 +74,16 @@ class TaobaoScraperNew:
         os.makedirs(self.user_data_dir, exist_ok=True)
         options.add_argument(f"--user-data-dir={self.user_data_dir}")
         options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--blink-settings=imagesEnabled=false")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option("useAutomationExtension", False)
+        options.add_experimental_option(
+            "prefs",
+            {
+                "profile.managed_default_content_settings.images": 2,
+                "profile.default_content_setting_values.images": 2,
+            },
+        )
 
         self.driver = webdriver.Chrome(
             service=Service(self.driver_path),
