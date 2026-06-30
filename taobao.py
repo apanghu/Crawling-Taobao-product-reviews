@@ -4,17 +4,43 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 import argparse
 import hashlib
+import html
 import json
 import logging
 import os
 import pickle
 import random
+import re
 import subprocess
 import sys
 import time
+
+
+def kill_existing_browser_processes(user_data_dir: str):
+    subprocess.run(
+        ["taskkill", "/F", "/T", "/IM", "chromedriver.exe"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+    escaped_user_data_dir = user_data_dir.replace("'", "''")
+    powershell_script = (
+        "Get-CimInstance Win32_Process "
+        "| Where-Object { $_.Name -eq 'chrome.exe' -and $_.CommandLine -like "
+        f"'*{escaped_user_data_dir}*' "
+        "} | Invoke-CimMethod -MethodName Terminate | Out-Null"
+    )
+    subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", powershell_script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    print("[启动] 已清理上次残留的 chromedriver 和脚本专用 Chrome 进程")
 
 
 class TaobaoScraperNew:
@@ -149,6 +175,327 @@ class TaobaoScraperNew:
     def _safe_filename(self, value: str) -> str:
         value = value.strip() or "unknown"
         return "".join(char if char.isalnum() or char in ("-", "_") else "_" for char in value)
+
+    def _normalize_url(self, url: str) -> str:
+        if not url:
+            return ""
+        url = url.strip()
+        if url.startswith("//"):
+            return "https:" + url
+        return url
+
+    def _canonical_product_url(self, url: str) -> str:
+        url = self._normalize_url(url)
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path = parsed.path.lower()
+        if "taobao.com" not in host and "tmall.com" not in host:
+            return ""
+        if "item.htm" not in path:
+            return ""
+
+        item_id = (parse_qs(parsed.query).get("id") or [""])[0]
+        if not item_id:
+            return ""
+
+        if "tmall.com" in parsed.netloc:
+            return f"https://detail.tmall.com/item.htm?id={item_id}"
+        return f"https://item.taobao.com/item.htm?id={item_id}"
+
+    def _collect_product_links_from_page(self) -> list:
+        links = self.driver.execute_script(
+            """
+            const productHref = (href) => href && /item\\.htm\\?.*\\bid=\\d+/.test(href);
+            const anchors = Array.from(document.querySelectorAll("a[href]"));
+            return anchors
+                .filter((a) => productHref(a.href || a.getAttribute("href") || ""))
+                .filter((a) => {
+                    const rect = a.getBoundingClientRect();
+                    return rect.width > 20 && rect.height > 20;
+                })
+                .map((a) => a.href || a.getAttribute("href") || "")
+                .filter(Boolean);
+            """
+        )
+
+        product_links = []
+        seen = set()
+        for link in links:
+            link = self._canonical_product_url(link)
+            if link and link not in seen:
+                seen.add(link)
+                product_links.append(link)
+
+        return product_links
+
+    def _find_shop_url(self, shop_name: str) -> str:
+        search_url = f"https://shopsearch.taobao.com/search?app=shopsearch&q={quote_plus(shop_name)}"
+        self.driver.get(search_url)
+        time.sleep(3)
+
+        candidates = self.driver.execute_script(
+            """
+            return Array.from(document.querySelectorAll("a[href]"))
+                .map((a) => ({
+                    text: (a.innerText || a.textContent || "").trim(),
+                    href: a.href || a.getAttribute("href") || ""
+                }))
+                .filter((item) => item.href);
+            """
+        )
+
+        normalized_name = shop_name.replace(" ", "").lower()
+        shop_candidates = []
+        for candidate in candidates:
+            href = self._normalize_url(candidate.get("href", ""))
+            text = (candidate.get("text") or "").replace(" ", "").lower()
+            if not href:
+                continue
+            parsed = urlparse(href)
+            host = parsed.netloc.lower()
+            path = parsed.path.lower()
+            if "item.htm" in path or "search" in host or "login" in host:
+                continue
+            looks_like_shop = (
+                host.startswith("shop") or
+                ".taobao.com" in host or
+                ".tmall.com" in host
+            )
+            if not looks_like_shop:
+                continue
+            score = 0
+            if normalized_name and normalized_name in text:
+                score += 100
+            if host.startswith("shop"):
+                score += 20
+            if "tmall.com" in host:
+                score += 10
+            if text:
+                score += 1
+            shop_candidates.append((score, href, text))
+
+        shop_candidates.sort(reverse=True, key=lambda item: item[0])
+        if shop_candidates:
+            return shop_candidates[0][1]
+
+        return ""
+
+    def _click_all_items_tab(self) -> bool:
+        result = self.driver.execute_script(
+            """
+            const anchors = Array.from(document.querySelectorAll("a[href]"));
+            const keywords = ["全部宝贝", "所有宝贝", "全部商品", "全部产品", "宝贝分类"];
+            const candidates = anchors
+                .map((a) => ({
+                    el: a,
+                    text: (a.innerText || a.textContent || "").trim(),
+                    href: a.href || a.getAttribute("href") || ""
+                }))
+                .filter((item) => item.href && keywords.some((word) => item.text.includes(word)));
+
+            if (!candidates.length) {
+                return { clicked: false, href: "", text: "" };
+            }
+
+            const target = candidates.find((item) => /search|category|shop/.test(item.href)) || candidates[0];
+            target.el.scrollIntoView({ block: "center" });
+            target.el.click();
+            return { clicked: true, href: target.href, text: target.text };
+            """
+        )
+
+        if not result or not result.get("clicked"):
+            print("[商品页] 未找到可点击的全部宝贝入口，使用备用商品页")
+            return False
+
+        print(f"[商品页] 已点击: {result.get('text')} -> {result.get('href')}")
+        time.sleep(3)
+        return True
+
+    def _fallback_shop_product_list_urls(self, shop_url: str) -> list:
+        shop_url = self._normalize_url(shop_url)
+        parsed = urlparse(shop_url)
+        base_url = f"{parsed.scheme or 'https'}://{parsed.netloc}"
+
+        urls = [
+            urljoin(base_url, "/search.htm?search=y"),
+            urljoin(base_url, "/category.htm?search=y"),
+            urljoin(base_url, "/?search=y"),
+            shop_url,
+        ]
+
+        unique_urls = []
+        seen = set()
+        for url in urls:
+            url = self._normalize_url(url)
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            unique_urls.append(url)
+
+        return unique_urls
+
+    def _collect_shop_product_urls(
+        self,
+        shop_name: str,
+        max_products: int = 0,
+        scroll_rounds: int = 80,
+    ) -> list:
+        shop_url = self._find_shop_url(shop_name)
+        if not shop_url:
+            print(f"[店铺] 未找到店铺: {shop_name}")
+            return []
+
+        print(f"[店铺] {shop_name} -> {shop_url}")
+        self.driver.get(shop_url)
+        time.sleep(3)
+        clicked_all_items = self._click_all_items_tab()
+        product_list_urls = [self.driver.current_url]
+        if not clicked_all_items:
+            product_list_urls = self._fallback_shop_product_list_urls(shop_url)
+
+        product_urls = []
+        seen = set()
+
+        for list_url in product_list_urls:
+            print(f"[商品页] 正在扫描: {list_url}")
+            self.driver.get(list_url)
+            time.sleep(2.5)
+            idle_rounds = 0
+
+            for _ in range(scroll_rounds):
+                before_count = len(product_urls)
+                for product_url in self._collect_product_links_from_page():
+                    if product_url in seen:
+                        continue
+                    seen.add(product_url)
+                    product_urls.append(product_url)
+                    print(f"[商品] {shop_name}: {product_url}")
+                    if max_products and len(product_urls) >= max_products:
+                        return product_urls
+
+                previous_height = self.driver.execute_script("return document.scrollingElement.scrollHeight")
+                self.driver.execute_script(
+                    """
+                    const scroller = document.scrollingElement || document.documentElement;
+                    scroller.scrollTop = Math.min(scroller.scrollTop + Math.max(window.innerHeight * 1.8, 900), scroller.scrollHeight);
+                    window.dispatchEvent(new Event("scroll"));
+                    """
+                )
+                time.sleep(random.uniform(1.0, 1.8))
+                current_height = self.driver.execute_script("return document.scrollingElement.scrollHeight")
+
+                if len(product_urls) == before_count and current_height == previous_height:
+                    idle_rounds += 1
+                else:
+                    idle_rounds = 0
+
+                if idle_rounds >= 6:
+                    break
+
+            if clicked_all_items and product_urls:
+                break
+
+        if clicked_all_items and not product_urls:
+            for list_url in self._fallback_shop_product_list_urls(shop_url):
+                print(f"[商品页] 点击后未采到商品，备用扫描: {list_url}")
+                self.driver.get(list_url)
+                time.sleep(2.5)
+                idle_rounds = 0
+
+                for _ in range(scroll_rounds):
+                    before_count = len(product_urls)
+                    for product_url in self._collect_product_links_from_page():
+                        if product_url in seen:
+                            continue
+                        seen.add(product_url)
+                        product_urls.append(product_url)
+                        print(f"[商品] {shop_name}: {product_url}")
+                        if max_products and len(product_urls) >= max_products:
+                            return product_urls
+
+                    previous_height = self.driver.execute_script("return document.scrollingElement.scrollHeight")
+                    self.driver.execute_script(
+                        """
+                        const scroller = document.scrollingElement || document.documentElement;
+                        scroller.scrollTop = Math.min(scroller.scrollTop + Math.max(window.innerHeight * 1.8, 900), scroller.scrollHeight);
+                        window.dispatchEvent(new Event("scroll"));
+                        """
+                    )
+                    time.sleep(random.uniform(1.0, 1.8))
+                    current_height = self.driver.execute_script("return document.scrollingElement.scrollHeight")
+
+                    if len(product_urls) == before_count and current_height == previous_height:
+                        idle_rounds += 1
+                    else:
+                        idle_rounds = 0
+
+                    if idle_rounds >= 6:
+                        break
+
+        print(f"[店铺] {shop_name} 共发现 {len(product_urls)} 个商品")
+        return product_urls
+
+    def scrape_shops_by_names(
+        self,
+        shop_names: list,
+        base_output_dir: str,
+        max_products_per_shop: int = 0,
+        max_comments_per_product: int = 0,
+    ):
+        os.makedirs(base_output_dir, exist_ok=True)
+        summary = {
+            "schema_version": "1.0",
+            "collected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "shops": [],
+        }
+        scraped_products = set()
+
+        for shop_name in shop_names:
+            shop_name = shop_name.strip()
+            if not shop_name:
+                continue
+
+            shop_key = self._safe_filename(shop_name)
+            shop_output_dir = os.path.join(base_output_dir, "shops", shop_key)
+            os.makedirs(shop_output_dir, exist_ok=True)
+
+            product_urls = self._collect_shop_product_urls(
+                shop_name,
+                max_products=max_products_per_shop,
+            )
+            shop_summary = {
+                "shop_name": shop_name,
+                "product_count": len(product_urls),
+                "products": product_urls,
+            }
+            summary["shops"].append(shop_summary)
+
+            for product_url in product_urls:
+                product_id = self._get_product_id(product_url) or hashlib.md5(product_url.encode("utf-8")).hexdigest()
+                if product_id in scraped_products:
+                    print(f"[跳过] 本轮已采集商品: {product_id}")
+                    continue
+                scraped_products.add(product_id)
+
+                product_output_dir = os.path.join(shop_output_dir, self._safe_filename(product_id))
+                os.makedirs(product_output_dir, exist_ok=True)
+                output_file = os.path.join(product_output_dir, "reviews.txt")
+
+                print(f"[采集] 店铺 {shop_name} 商品 {product_id}")
+                self.scrape_reviews(
+                    output_file=output_file,
+                    max_comments=max_comments_per_product,
+                    manual_input=False,
+                    preset_url=product_url,
+                )
+                self.remove_default_reviews(output_file)
+
+            summary_file = os.path.join(base_output_dir, "shops_latest.json")
+            with open(summary_file, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+
+        print(f"[保存] 店铺批量采集摘要已保存到: {os.path.join(base_output_dir, 'shops_latest.json')}")
 
     def _collect_product_info(self, product_url: str) -> dict:
         info = self.driver.execute_script(
@@ -545,10 +892,34 @@ if __name__ == "__main__":
     parser.add_argument("--preset_url", type=str, default="", help="预设商品链接")
     parser.add_argument("--max_comments", type=int, default=0, help="最多采集多少条评论，0 表示不限制")
     parser.add_argument(
+        "--shop_names",
+        type=str,
+        default="",
+        help="店铺名称列表，可用逗号、顿号、分号或换行分隔",
+    )
+    parser.add_argument(
+        "--shop_names_file",
+        type=str,
+        default="",
+        help="店铺名称文本文件，一行一个店铺名",
+    )
+    parser.add_argument(
+        "--max_products_per_shop",
+        type=int,
+        default=0,
+        help="每个店铺最多采集多少个商品，0 表示不限制",
+    )
+    parser.add_argument(
         "--output_file",
         type=str,
         default=r"AIGC\Comment_crawling_and_analysis\reviews.txt",
         help="评论文本输出路径",
+    )
+    parser.add_argument(
+        "--kill_existing",
+        type=lambda x: x.lower() == "true",
+        default=True,
+        help="启动前是否清理上次残留的 chromedriver 和脚本专用 Chrome 进程",
     )
 
     args = parser.parse_args()
@@ -560,12 +931,30 @@ if __name__ == "__main__":
 
     logging.info(f"启动爬虫，参数: manual_input={args.manual_input}, preset_url={args.preset_url}")
 
-    with TaobaoScraperNew(driver_path=driver_path) as scraper:
+    user_data_dir = r"C:\taobao_bot_profile"
+    if args.kill_existing:
+        kill_existing_browser_processes(user_data_dir)
+
+    shop_names_text = args.shop_names
+    if args.shop_names_file:
+        with open(args.shop_names_file, "r", encoding="utf-8") as f:
+            shop_names_text += "\n" + f.read()
+    shop_names = [name.strip() for name in re.split(r"[,，、;；\n\r]+", shop_names_text) if name.strip()]
+
+    with TaobaoScraperNew(driver_path=driver_path, user_data_dir=user_data_dir) as scraper:
         scraper.ensure_login()
-        scraper.scrape_reviews(
-            output_file=args.output_file,
-            max_comments=args.max_comments,
-            manual_input=args.manual_input,
-            preset_url=args.preset_url,
-        )
-        scraper.remove_default_reviews(args.output_file)
+        if shop_names:
+            scraper.scrape_shops_by_names(
+                shop_names=shop_names,
+                base_output_dir=os.path.dirname(args.output_file) or ".",
+                max_products_per_shop=args.max_products_per_shop,
+                max_comments_per_product=args.max_comments,
+            )
+        else:
+            scraper.scrape_reviews(
+                output_file=args.output_file,
+                max_comments=args.max_comments,
+                manual_input=args.manual_input,
+                preset_url=args.preset_url,
+            )
+            scraper.remove_default_reviews(args.output_file)
